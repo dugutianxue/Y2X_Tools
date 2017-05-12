@@ -1,0 +1,52 @@
+最近web服务器在大流量情况下经常出现假死现象，后台log报 too many open files 的错误，加大linux系统的文件打开数是可以解决部分问题，但是时间长了同样出问题，通过查询网络连接发现是tcp连接不关闭造成的。如下：
+  netstat -n | awk '/^tcp/ {++S[$NF]} END {for(a in S) print a, S[a]}'
+  
+  LAST_ACK 1
+  SYN_RECV 15
+  CLOSE_WAIT 7729 
+  ESTABLISHED 471
+  FIN_WAIT1 3
+  FIN_WAIT2 52
+  SYN_SENT 1
+  TIME_WAIT 725 
+
+
+
+
+  从结果可以看到有大量的连接处于CLOSE_WAIT状态。 
+
+
+
+
+
+
+
+要解决这个问题的可以修改系统的参数，系统默认超时时间的是7200秒，也就是2小时。 
+
+默认如下： 
+
+tcp_keepalive_time = 7200 seconds (2 hours)
+tcp_keepalive_probes = 9
+tcp_keepalive_intvl = 75 seconds 
+
+
+
+
+意思是如果某个TCP连接在idle 2个小时后,内核才发起probe.如果probe 9次(每次75秒)不成功,内核才彻底放弃,认为该连接已失效 
+
+
+
+
+修改后 
+
+
+
+
+sysctl -w net.ipv4.tcp_keepalive_time=30
+sysctl -w net.ipv4.tcp_keepalive_probes=2
+sysctl -w net.ipv4.tcp_keepalive_intvl=2 
+
+
+
+
+经过这个修改后，服务器会在短时间里回收没有关闭的tcp连接

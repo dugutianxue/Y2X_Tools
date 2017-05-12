@@ -1,0 +1,342 @@
+现象:在netstat的时候发现大量处于LAST_ACK状态的TCP连接，达到在ESTABLISHED状态的90%以上
+
+[root@ccsafe ~]# netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c                
+      6 CLOSE_WAIT 
+      7 CLOSING     
+   6838 ESTABLISHED 
+   1037 FIN_WAIT1   
+    357 FIN_WAIT2   
+   5830 LAST_ACK    
+      2 LISTEN      
+    276 SYN_RECV    
+     71 TIME_WAIT   
+[root@ccsafe ~]# 
+
+看看系统状态，性能都花在系统中断和上下文切换
+[root@ccsafe ~]# vmstat 2
+procs -----------memory---------- ---swap-- -----io---- --system-- -----cpu------
+r b   swpd   free   buff cache   si   so    bi    bo   in   cs us sy id wa st
+1 0      0 3091812 363032 284132    0    0     0     0    1    1 0 0 100 0 0
+0 0      0 3091812 363032 284132    0    0     0     0 13750 3174 0 5 94 0 0
+0 0      0 3091936 363032 284132    0    0     0     0 13666 3057 1 5 94 0 0
+0 0      0 3092060 363032 284132    0    0     0    16 13749 3030 0 5 95 0 0
+0 0      0 3092060 363032 284132    0    0     0     0 13822 3144 0 5 95 0 0
+0 0      0 3092060 363032 284132    0    0     0     0 13390 2961 0 5 95 0 0
+0 0      0 3092060 363032 284132    0    0     0     0 13541 3182 0 6 94 0 0
+
+
+查看socket队列信息
+[root@ccsafe ~]# sar -n SOCK 5 
+Linux 2.6.18-53.1.13.el5PAE (ccsafe)     10/21/2008
+
+06:31:43 PM    totsck    tcpsck    udpsck    rawsck   ip-frag    tcp-tw
+06:31:48 PM      6951     13868         1         0         0       430
+Average:         6951     13868         1         0         0       430
+
+根据TCP状态的变化过程来分析，LAST_ACK属于被动关闭连接过程中的状态
+ESTABLISHED->CLOSE_WAIT->（发送ACK）->LAST_ACK->(发送FIN+接收ACK)->CLOSED
+现在状态都堆积到LAST_ACK，初步判断问题从上下两个状态着手
+
+调节一下LAST_ACK时间...
+[root@ccsafe ~]# sysctl -a |grep last_ack
+net.ipv4.netfilter.ip_conntrack_tcp_timeout_last_ack = 30
+
+[root@ccsafe ~]# sysctl -w net.ipv4.netfilter.ip_conntrack_tcp_timeout_last_ack=10
+net.ipv4.netfilter.ip_conntrack_tcp_timeout_last_ack = 10
+[root@ccsafe ~]# sysctl -p
+
+[root@ccsafe ~]# watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+Every 5.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                    
+
+      6 CLOSE_WAIT
+      9 CLOSING
+   6420 ESTABLISHED
+    693 FIN_WAIT1
+    391 FIN_WAIT2
+   5081 LAST_ACK
+      2 LISTEN
+    203 SYN_RECV
+     66 TIME_WAIT
+
+检查一下LAST_ACK所对应的应用
+[root@ccsafe ~]# netstat -ant|fgrep "LAST_ACK"|cut -b 49-75|cut -d ":" -f1|sort |uniq -c|sort -nr --key=1,7|head -5
+    101 220.160.210.6
+     46 222.75.65.69
+     31 221.0.91.118
+     24 222.210.8.160
+     22 60.161.81.28
+[root@ccsafe ~]# 
+
+[root@ccsafe ~]# netstat -an|grep "220.160.210.6"
+tcp        0 17280 10.1.1.145:80           220.160.210.6:52787         ESTABLISHED 
+tcp        1 14401 10.1.1.145:80           220.160.210.6:52513         LAST_ACK    
+tcp        1 14401 10.1.1.145:80           220.160.210.6:52769         LAST_ACK    
+tcp        1 14401 10.1.1.145:80           220.160.210.6:52768         LAST_ACK    
+tcp        0   8184 10.1.1.145:80           220.160.210.6:52515         LAST_ACK    
+tcp        1 14401 10.1.1.145:80           220.160.210.6:52514         LAST_ACK    
+tcp        0   8184 10.1.1.145:80           220.160.210.6:52781         LAST_ACK    
+
+
+是TCP80端口的应用，调节一下nginx的keepalive时间...
+[root@ccsafe ~]# /usr/local/nginx/sbin/nginx -t -c /usr/local/nginx/conf/nginx.conf 
+2008/10/21 19:15:31 [info] 21352#0: the configuration file /usr/local/nginx/conf/nginx.conf syntax is ok
+2008/10/21 19:15:31 [info] 21352#0: the configuration file /usr/local/nginx/conf/nginx.conf was tested successfully
+[root@ccsafe ~]# ps aux|egrep '(PID|nginx)'
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root      8290 0.0 0.0   7572 1124 ?        Ss   Oct04   0:00 nginx: master process /usr/local/nginx/sbin/nginx
+nobody    8291 0.2 0.3 19704 13776 ?        S    Oct04 71:35 nginx: worker process      
+nobody    8292 0.3 0.2 17604 11680 ?        S    Oct04 77:26 nginx: worker process      
+nobody    8293 0.2 0.4 22528 16636 ?        S    Oct04 58:13 nginx: worker process      
+nobody    8294 0.3 0.4 24944 19020 ?        S    Oct04 94:07 nginx: worker process      
+nobody    8295 0.3 0.5 27496 21508 ?        S    Oct04 84:41 nginx: worker process      
+nobody    8296 0.3 0.1 13388 7496 ?        S    Oct04 84:14 nginx: worker process      
+nobody    8297 0.2 0.0   9196 3268 ?        S    Oct04 58:21 nginx: worker process      
+nobody    8298 0.3 0.2 15392 9504 ?        S    Oct04 75:16 nginx: worker process      
+root     21354 0.0 0.0   3896   720 pts/0    S+   19:15   0:00 egrep (PID|nginx)
+（动态加载新配置）
+[root@ccsafe ~]# kill -HUP 8290 
+[root@ccsafe ~]# 
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90 |sort |uniq -c                                               
+
+      1 CLOSE_WAIT
+   1138 CLOSING
+   7161 ESTABLISHED
+   1427 FIN_WAIT1
+    396 FIN_WAIT2
+   5740 LAST_ACK
+      2 LISTEN
+    350 SYN_RECV
+    148 TIME_WAIT
+
+...
+
+[root@ccsafe ~]# netstat -ant|fgrep ":"|cut -b 77-90 |sort |uniq -c
+   1151 CLOSING     
+   8506 ESTABLISHED 
+   1452 FIN_WAIT1   
+    666 FIN_WAIT2   
+   6568 LAST_ACK    
+      2 LISTEN      
+    429 SYN_RECV    
+     92 TIME_WAIT   
+
+...
+
+
+LAST_ACK不下，而且CLOSING 和FIN_WAIT突增
+
+着重看看可影响主动断开TCP连接时几个参数
+tcp_keepalive_intvl:探测消息发送的频率
+tcp_keepalive_probes:TCP发送keepalive探测以确定该连接已经断开的次数
+tcp_keepalive_time:当keepalive打开的情况下，TCP发送keepalive消息的频率
+
+[root@ccsafe ~]# sysctl -a|grep tcp_keepalive
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 2
+net.ipv4.tcp_keepalive_time = 160
+
+tcp_retries2:在丢弃激活(已建立通讯状况)的TCP连接之前﹐需要进行多少次重试
+[root@ccsafe ~]# sysctl -a |grep tcp_retries
+net.ipv4.tcp_retries2 = 15
+net.ipv4.tcp_retries1 = 3
+
+加速处理那些等待ACK的LAST_ACK，减少等待ACK的LAST_ACK的重试次数
+[root@ccsafe ~]# sysctl -w net.ipv4.tcp_retries2=5
+net.ipv4.tcp_retries2 = 5
+
+减少keepalive发送的频率
+[root@ccsafe ~]# sysctl -w net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_intvl = 15
+[root@ccsafe ~]# sysctl -p
+
+排除syncookies的影响
+[root@ccsafe ~]# !ec
+echo "0" >/proc/sys/net/ipv4/tcp_syncookies
+[root@ccsafe ~]# echo "1" >/proc/sys/net/ipv4/tcp_syncookies 
+
+[root@ccsafe ~]# sysctl -a|grep tcp_keepalive               
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 2
+net.ipv4.tcp_keepalive_time = 160
+
+[root@ccsafe ~]# sysctl -a|grep syncookies
+net.ipv4.tcp_syncookies = 1
+
+延长keepalive检测周期，保留ESTABLISHED数量
+[root@ccsafe ~]# echo "1800" >/proc/sys/net/ipv4/tcp_keepalive_time
+[root@ccsafe ~]# echo "5" >/proc/sys/net/ipv4/tcp_keepalive_probes
+[root@ccsafe ~]# echo "15" >/proc/sys/net/ipv4/tcp_keepalive_intvl
+[root@ccsafe ~]# sysctl -a|grep tcp_keepalive                      
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_time = 1800
+
+[root@ccsafe ~]# !wat
+watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                         
+
+      1 CLOSE_WAIT
+    363 CLOSING
+   5145 ESTABLISHED
+   1073 FIN_WAIT1
+    174 FIN_WAIT2
+   6042 LAST_ACK
+      2 LISTEN
+    301 SYN_RECV
+     85 TIME_WAIT
+
+
+LAST_ACK不下，但是CLOSING有所回落
+tcp_orphan_retries:在近端丢弃TCP连接之前﹐要进行多少次重试。
+[root@ccsafe ~]# sysctl -a|grep tcp_orphan
+net.ipv4.tcp_orphan_retries = 0
+
+关键，丢TCP太频繁了，以至于后勤都跟不上。设置丢弃之前的重试次数
+[root@ccsafe ~]# echo "3" >/proc/sys/net/ipv4/tcp_orphan_retries
+[root@ccsafe ~]# !wat
+watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                         
+
+      1 CLOSE_WAIT
+     24 CLOSING
+   5422 ESTABLISHED
+    279 FIN_WAIT1
+    214 FIN_WAIT2
+   1966 LAST_ACK
+      2 LISTEN
+    269 SYN_RECV
+     74 TIME_WAIT
+
+上下调节该值，找个合适的临界点
+[root@ccsafe ~]# echo "7" >/proc/sys/net/ipv4/tcp_orphan_retries                 
+[root@ccsafe ~]# !wat
+watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                         
+
+      1 CLOSE_WAIT
+    175 CLOSING
+   5373 ESTABLISHED
+    436 FIN_WAIT1
+    209 FIN_WAIT2
+   3184 LAST_ACK
+      2 LISTEN
+    283 SYN_RECV
+    110 TIME_WAIT
+
+恢复，同时FIN_WAIT1的值过高。考虑减少tcp_fin_timeout时间
+[root@ccsafe ~]# echo "2" >/proc/sys/net/ipv4/tcp_orphan_retries                 
+
+[root@ccsafe ~]# sysctl -a|grep tcp_fin
+net.ipv4.tcp_fin_timeout = 10
+
+[root@ccsafe ~]# echo "5" >/proc/sys/net/ipv4/tcp_fin_timeout
+[root@ccsafe ~]# !wat
+watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                         
+
+      2 CLOSE_WAIT
+     17 CLOSING
+   5665 ESTABLISHED
+    145 FIN_WAIT1
+    141 FIN_WAIT2
+   1068 LAST_ACK
+      2 LISTEN
+    287 SYN_RECV
+     68 TIME_WAIT
+
+相比FIN_WAIT，SYN_RECV的值偏高。加大发送synack的质量
+[root@ccsafe ~]# sysctl -a|grep synack
+net.ipv4.tcp_synack_retries = 1
+[root@ccsafe ~]# echo "2" >/proc/sys/net/ipv4/tcp_synack_retries
+[root@ccsafe ~]# !wat
+watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                         
+
+      3 CLOSE_WAIT
+     16 CLOSING
+   5317 ESTABLISHED
+    200 FIN_WAIT1
+    158 FIN_WAIT2
+   1001 LAST_ACK
+      2 LISTEN
+    303 SYN_RECV
+     78 TIME_WAIT
+
+[root@ccsafe ~]# sysctl -a|grep keepalive
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_time = 1800
+[root@ccsafe ~]# watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                         
+
+      1 CLOSE_WAIT
+      7 CLOSING
+   5356 ESTABLISHED
+    175 FIN_WAIT1
+    136 FIN_WAIT2
+   1045 LAST_ACK
+      2 LISTEN
+    345 SYN_RECV
+     64 TIME_WAIT
+
+减少keepalive的检测周期，LAST_ACK上升
+[root@ccsafe ~]# echo "10" >/proc/sys/net/ipv4/tcp_keepalive_intvl
+[root@ccsafe ~]# echo "1" >/proc/sys/net/ipv4/tcp_synack_retries                 
+[root@ccsafe ~]# !wat
+watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                                                
+
+      1 CLOSE_WAIT
+     13 CLOSING
+   5605 ESTABLISHED
+    212 FIN_WAIT1
+    131 FIN_WAIT2
+   1143 LAST_ACK
+      2 LISTEN
+    252 SYN_RECV
+     79 TIME_WAIT
+
+恢复
+[root@ccsafe ~]# echo "15" >/proc/sys/net/ipv4/tcp_keepalive_intvl               
+
+[root@ccsafe ~]# watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                        
+
+      3 CLOSE_WAIT
+     14 CLOSING
+   5862 ESTABLISHED
+    230 FIN_WAIT1
+    205 FIN_WAIT2
+   1064 LAST_ACK
+      2 LISTEN
+    244 SYN_RECV
+     59 TIME_WAIT
+
+
+[root@ccsafe ~]# watch -n 10 "netstat -ant|fgrep ":"|cut -b 77-90|sort |uniq -c"
+
+Every 10.0s: netstat -ant|fgrep :|cut -b 77-90|sort |uniq -c                        
+
+      3 CLOSE_WAIT
+     26 CLOSING
+   6712 ESTABLISHED
+    270 FIN_WAIT1
+    230 FIN_WAIT2
+    994 LAST_ACK
+      2 LISTEN
+    254 SYN_RECV
+     73 TIME_WAIT
+
+
+[root@ccsafe ~]# 
+
+目前LAST_ACK占ESTABLISHED的量在15%左右

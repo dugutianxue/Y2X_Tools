@@ -1,0 +1,50 @@
+新增的一组Apache服务器上线以来，我用netstat -an命令发现服务器中有大量状态为TIME-WAIT的TCP连接，于是用/sbin/sysctl -a查看了一下Linux的各项内核参数，并翻阅有关资料，决定修改其中的两项参数，以达到减少TCP连接中TIME-WAIT sockets的目的。 
+
+
+
+vi /etc/sysctl.conf 
+
+编辑/etc/sysctl.conf文件，增加三行： 
+
+引用 
+net.ipv4.tcp_syncookies = 1 
+
+net.ipv4.tcp_tw_reuse = 1 
+
+net.ipv4.tcp_tw_recycle = 1 
+
+说明： 
+
+net.ipv4.tcp_syncookies = 1 表示开启SYN Cookies。当出现SYN等待队列溢出时，启用cookies来处理，可防范少量SYN攻击，默认为0，表示关闭； 
+
+net.ipv4.tcp_tw_reuse = 1 表示开启重用。允许将TIME-WAIT sockets重新用于新的TCP连接，默认为0，表示关闭； 
+
+net.ipv4.tcp_tw_recycle = 1 表示开启TCP连接中TIME-WAIT sockets的快速回收，默认为0，表示关闭。 
+
+
+
+再执行以下命令，让修改结果立即生效： 
+
+/sbin/sysctl -p 
+
+
+
+用以下语句看了一下服务器的TCP状态： 
+
+netstat -n | awk '/^tcp/ {++S[$NF]} END {for(a in S) print a, S[a]}' 
+
+返回结果如下： 
+
+ESTABLISHED 1423 
+
+FIN_WAIT1 1 
+
+FIN_WAIT2 262 
+
+SYN_SENT 1 
+
+TIME_WAIT 962 
+
+
+
+效果：处于TIME_WAIT状态的sockets从原来的10000多减少到1000左右。处于SYN_RECV等待处理状态的sockets为0，原来的为50～300。
